@@ -157,3 +157,76 @@ test('scrapeBiographies follows postbacks and enriches records from biography pa
     server.close();
   }
 });
+
+function createPagedServer(totalPages) {
+  function renderPage(page) {
+    const groupStart = page <= 10 ? 1 : 11;
+    const groupEnd = Math.min(totalPages, groupStart + 9);
+    const pagerLabels = [];
+
+    for (let n = groupStart; n <= groupEnd; n += 1) {
+      pagerLabels.push(n === page ? { label: String(n), current: true } : { label: String(n), id: `pager_${n}` });
+    }
+
+    if (groupEnd < totalPages) {
+      pagerLabels.push({ label: '>', id: 'pager_next' });
+    }
+
+    return pageHtml({
+      currentPage: page,
+      pagerLabels,
+      biographies: [
+        { url: `/a/biografia/person-${page}`, name: `Person ${page}`, dates: '1900-1980', activities: ['test'] }
+      ]
+    });
+  }
+
+  return http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/Search/Type,Biography/Initial,A/') {
+      res.setHeader('content-type', 'text/html; charset=utf-8');
+      res.end(renderPage(1));
+      return;
+    }
+
+    if (req.method === 'POST' && req.url === '/Search/Type,Biography/Initial,A/') {
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => {
+        const params = new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+        const target = params.get('PRADO_POSTBACK_TARGET');
+        const requestedPage = target === 'pager$next' ? 11 : Number.parseInt((target || '').replace('pager$', ''), 10);
+
+        res.setHeader('content-type', 'text/html; charset=utf-8');
+        res.end(renderPage(Number.isFinite(requestedPage) ? requestedPage : 1));
+      });
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end('Not found');
+  });
+}
+
+test('scrapeBiographies continues past the first visible pager group', async () => {
+  const server = createPagedServer(12);
+  await new Promise((resolve) => server.listen(0, resolve));
+
+  const { port } = server.address();
+  const baseUrl = `http://127.0.0.1:${port}/Search/Type,Biography/Initial,A/`;
+
+  try {
+    const result = await scrapeBiographies({
+      baseUrl,
+      delayMs: 0,
+      timeoutMs: 5000,
+      fetchDetails: false
+    });
+
+    assert.equal(result.totalPages, 12);
+    assert.equal(result.scrapedPages, 12);
+    assert.equal(result.records.length, 12);
+    assert.equal(result.records.at(-1).name, 'Person 12');
+  } finally {
+    server.close();
+  }
+});
