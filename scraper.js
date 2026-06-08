@@ -28,6 +28,15 @@ function extractTotalPages($) {
   return numericLabels.length ? Math.max(...numericLabels) : 1;
 }
 
+function extractCurrentPage($) {
+  const currentPage = $('.pages span')
+    .map((_, el) => Number.parseInt(normalizeText($(el).text()), 10))
+    .get()
+    .filter((n) => Number.isFinite(n));
+
+  return currentPage.length ? Math.max(...currentPage) : 1;
+}
+
 function extractBiographyItems($, baseUrl) {
   return $('.personItem')
     .map((_, item) => {
@@ -264,61 +273,54 @@ async function scrapeViaPostback({ baseUrl, delayMs, maxPages, timeoutMs, firstH
   let html = firstHtml;
   let cookies = firstCookies;
   let $ = cheerio.load(html);
-
-  const totalPages = extractTotalPages($);
-  const pagesToVisit = Math.max(1, Math.min(totalPages, maxPages || totalPages));
+  const pageLimit = maxPages && maxPages > 0 ? maxPages : Infinity;
+  let totalPages = extractTotalPages($);
+  let scrapedPages = 1;
   const records = [];
 
   records.push(...extractBiographyItems($, baseUrl));
-  console.log(`Scraped page 1/${pagesToVisit} (${records.length} cumulative records)`);
+  console.log(`Scraped page 1/${Number.isFinite(pageLimit) ? pageLimit : '?'} (${records.length} cumulative records)`);
 
-  for (let targetPage = 2; targetPage <= pagesToVisit; targetPage += 1) {
-    let { numeric, nextId } = getPaginationTargets($);
+  for (let targetPage = 2; targetPage <= pageLimit; targetPage += 1) {
+    let reachedTargetPage = false;
 
-    while (!numeric.has(targetPage) && nextId) {
+    while (!reachedTargetPage) {
+      const { numeric, nextId } = getPaginationTargets($);
+      totalPages = Math.max(totalPages, ...numeric.keys(), scrapedPages);
+
+      const pageLinkId = numeric.get(targetPage) || nextId;
+      if (!pageLinkId) {
+        return { totalPages: Math.max(totalPages, scrapedPages), scrapedPages, records, cookies };
+      }
+
       const state = parseAspNetState($);
       const postUrl = absoluteUrl(baseUrl, state.action);
       const response = await fetchHtml(postUrl, {
         timeoutMs,
         method: 'POST',
-        formBody: buildPostbackBody(state, nextId),
+        formBody: buildPostbackBody(state, pageLinkId),
         cookies
       });
 
       html = response.html;
       cookies = response.cookies;
       $ = cheerio.load(html);
-      ({ numeric, nextId } = getPaginationTargets($));
+      totalPages = Math.max(totalPages, extractTotalPages($), scrapedPages);
+      reachedTargetPage = extractCurrentPage($) === targetPage || Boolean(numeric.get(targetPage));
     }
 
-    const pageLinkId = numeric.get(targetPage);
-    if (!pageLinkId) {
-      throw new Error(`Cannot find postback link for page ${targetPage}`);
-    }
-
-    const state = parseAspNetState($);
-    const postUrl = absoluteUrl(baseUrl, state.action);
-    const response = await fetchHtml(postUrl, {
-      timeoutMs,
-      method: 'POST',
-      formBody: buildPostbackBody(state, pageLinkId),
-      cookies
-    });
-
-    html = response.html;
-    cookies = response.cookies;
-    $ = cheerio.load(html);
+    scrapedPages = targetPage;
 
     const pageItems = extractBiographyItems($, baseUrl);
     records.push(...pageItems);
-    console.log(`Scraped page ${targetPage}/${pagesToVisit} (${pageItems.length} records)`);
+    console.log(`Scraped page ${targetPage}/${Number.isFinite(pageLimit) ? pageLimit : '?'} (${pageItems.length} records)`);
 
-    if (targetPage < pagesToVisit && delayMs > 0) {
+    if (targetPage < pageLimit && delayMs > 0) {
       await sleep(delayMs);
     }
   }
 
-  return { totalPages, scrapedPages: pagesToVisit, records, cookies };
+  return { totalPages, scrapedPages, records, cookies };
 }
 
 async function mapWithConcurrency(items, worker, concurrency) {
@@ -448,6 +450,7 @@ if (require.main === module) {
 
 module.exports = {
   extractTotalPages,
+  extractCurrentPage,
   extractBiographyItems,
   extractBiographyDetails,
   getPostbackTargetFromId,
