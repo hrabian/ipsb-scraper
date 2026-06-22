@@ -60,6 +60,30 @@ function extractBiographyItems($, baseUrl) {
     .get();
 }
 
+function extractInitialUrls($, baseUrl) {
+  const urls = $('.initials a, .letters a, .alphabet a, a[href*="/Search/Type,Biography/Initial,"]')
+    .map((_, a) => $(a).attr('href') || '')
+    .get()
+    .filter(Boolean)
+    .map((href) => absoluteUrl(baseUrl, href));
+
+  return [...new Set(urls)];
+}
+
+function buildInitialUrls(baseUrl, initials) {
+  if (!initials || initials.length === 0) {
+    return [baseUrl];
+  }
+
+  return initials.map((initial) => {
+    const encoded = encodeURIComponent(initial);
+    if (/Initial,[^/]+/i.test(baseUrl)) {
+      return baseUrl.replace(/Initial,[^/]+/i, `Initial,${encoded}`);
+    }
+    return absoluteUrl(baseUrl, `/Search/Type,Biography/Initial,${encoded}/`);
+  });
+}
+
 function extractBiographyDetails($, biographyUrl) {
   const givenName = normalizeText($('[itemprop="givenName"]').first().text());
   const familyName = normalizeText($('[itemprop="familyName"]').first().text());
@@ -344,7 +368,7 @@ async function mapWithConcurrency(items, worker, concurrency) {
 }
 
 async function enrichWithBiographyPages({ rows, timeoutMs, delayMs, cookies, detailConcurrency }) {
-  const uniqueRows = rows.filter((row) => row.url);
+  const uniqueRows = [...new Map(rows.filter((row) => row.url).map((row) => [row.url, row])).values()];
 
   const detailsByUrl = new Map();
 
@@ -386,31 +410,60 @@ async function scrapeBiographies({
   timeoutMs,
   fetchDetails = true,
   detailsDelayMs = 300,
-  detailConcurrency = 3
+  detailConcurrency = 3,
+  initials,
+  discoverInitials = false
 }) {
   const first = await fetchHtml(baseUrl, { timeoutMs });
-  const listing = await scrapeViaPostback({
-    baseUrl,
-    delayMs,
-    maxPages,
-    timeoutMs,
-    firstHtml: first.html,
-    firstCookies: first.cookies
-  });
+  const firstPage = cheerio.load(first.html);
+  const initialUrls = discoverInitials
+    ? extractInitialUrls(firstPage, baseUrl)
+    : buildInitialUrls(baseUrl, initials);
+  const urlsToScrape = initialUrls.length ? initialUrls : [baseUrl];
+
+  const allRecords = [];
+  let totalPages = 0;
+  let scrapedPages = 0;
+  let latestCookies = first.cookies;
+
+  for (const [index, initialUrl] of urlsToScrape.entries()) {
+    const initialFirst = index === 0 && initialUrl === baseUrl
+      ? first
+      : await fetchHtml(initialUrl, { timeoutMs, cookies: latestCookies });
+
+    const listing = await scrapeViaPostback({
+      baseUrl: initialUrl,
+      delayMs,
+      maxPages,
+      timeoutMs,
+      firstHtml: initialFirst.html,
+      firstCookies: initialFirst.cookies
+    });
+
+    latestCookies = listing.cookies;
+    totalPages += listing.totalPages;
+    scrapedPages += listing.scrapedPages;
+    allRecords.push(...listing.records);
+
+    console.log(`Completed initial ${index + 1}/${urlsToScrape.length}: ${initialUrl}`);
+    if (index < urlsToScrape.length - 1 && delayMs > 0) {
+      await sleep(delayMs);
+    }
+  }
 
   const records = fetchDetails
     ? await enrichWithBiographyPages({
-        rows: listing.records,
+        rows: allRecords,
         timeoutMs,
         delayMs: detailsDelayMs,
-        cookies: listing.cookies,
+        cookies: latestCookies,
         detailConcurrency
       })
-    : listing.records;
+    : allRecords;
 
   return {
-    totalPages: listing.totalPages,
-    scrapedPages: listing.scrapedPages,
+    totalPages,
+    scrapedPages,
     records
   };
 }
@@ -424,7 +477,14 @@ async function main() {
     timeoutMs: Number.parseInt(process.env.TIMEOUT_MS || '30000', 10),
     fetchDetails: process.env.FETCH_DETAILS === 'false' ? false : true,
     detailsDelayMs: Number.parseInt(process.env.DETAILS_DELAY_MS || '300', 10),
-    detailConcurrency: Number.parseInt(process.env.DETAIL_CONCURRENCY || '3', 10)
+    detailConcurrency: Number.parseInt(process.env.DETAIL_CONCURRENCY || '3', 10),
+    initials: process.env.INITIALS === 'discover'
+      ? undefined
+      : (process.env.INITIALS || 'A,Ą,B,C,Ć,D,E,F,G,H,I,J,K,L,Ł,M,N,O,Ó,P,R,S,Ś,T,U,W,Y,Z,Ź,Ż')
+          .split(',')
+          .map((x) => x.trim())
+          .filter(Boolean),
+    discoverInitials: process.env.INITIALS === 'discover'
   };
 
   try {
@@ -453,6 +513,8 @@ module.exports = {
   extractCurrentPage,
   extractBiographyItems,
   extractBiographyDetails,
+  extractInitialUrls,
+  buildInitialUrls,
   getPostbackTargetFromId,
   parseAspNetState,
   getPaginationTargets,

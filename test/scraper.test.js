@@ -10,7 +10,9 @@ const {
   parseAspNetState,
   getPaginationTargets,
   toCsv,
-  updateCookies
+  updateCookies,
+  extractInitialUrls,
+  buildInitialUrls
 } = require('../scraper');
 
 test('extractTotalPages returns highest visible page number from links and span', () => {
@@ -124,4 +126,24 @@ test('toCsv escapes commas and quotes and keeps biography columns', () => {
 test('updateCookies keeps full cookie values including "="', () => {
   const updated = updateCookies(['token=abc=123'], ['session=new=value; Path=/; HttpOnly']);
   assert.deepEqual(updated.sort(), ['session=new=value', 'token=abc=123'].sort());
+});
+
+test('extractInitialUrls discovers unique initial links and buildInitialUrls replaces current initial', () => {
+  const $ = cheerio.load(`
+    <div class="alphabet">
+      <a href="/Search/Type,Biography/Initial,A/">A</a>
+      <a href="/Search/Type,Biography/Initial,B/">B</a>
+      <a href="/Search/Type,Biography/Initial,A/">A duplicate</a>
+    </div>
+  `);
+
+  assert.deepEqual(extractInitialUrls($, 'https://www.ipsb.nina.gov.pl/Search/Type,Biography/Initial,A/'), [
+    'https://www.ipsb.nina.gov.pl/Search/Type,Biography/Initial,A/',
+    'https://www.ipsb.nina.gov.pl/Search/Type,Biography/Initial,B/'
+  ]);
+
+  assert.deepEqual(buildInitialUrls('https://www.ipsb.nina.gov.pl/Search/Type,Biography/Initial,A/', ['A', 'Ł']), [
+    'https://www.ipsb.nina.gov.pl/Search/Type,Biography/Initial,A/',
+    'https://www.ipsb.nina.gov.pl/Search/Type,Biography/Initial,%C5%81/'
+  ]);
 });
