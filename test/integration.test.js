@@ -230,3 +230,177 @@ test('scrapeBiographies continues past the first visible pager group', async () 
     server.close();
   }
 });
+
+test('scrapeBiographies can scrape more than one initial and fetch duplicate details once', async () => {
+  let duplicateDetailRequests = 0;
+
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+
+    if (req.method === 'GET' && req.url === '/Search/Type,Biography/Initial,A/') {
+      res.end(pageHtml({
+        currentPage: 1,
+        pagerLabels: [{ label: '1', current: true }],
+        biographies: [
+          { url: '/a/biografia/shared', name: 'Shared A', dates: '1900-1980', activities: ['test'] },
+          { url: '/a/biografia/shared', name: 'Shared A duplicate', dates: '1900-1980', activities: ['test'] }
+        ]
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/Search/Type,Biography/Initial,B/') {
+      res.end(pageHtml({
+        currentPage: 1,
+        pagerLabels: [{ label: '1', current: true }],
+        biographies: [{ url: '/a/biografia/beta', name: 'Beta', dates: '1910-1990', activities: ['test'] }]
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/a/biografia/shared') {
+      duplicateDetailRequests += 1;
+      res.end(biographyHtml({
+        name: 'Shared',
+        surname: 'Person',
+        birth: '1900-01-01',
+        death: '1980-01-01',
+        activities: ['test'],
+        description: 'Shared biography.'
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/a/biografia/beta') {
+      res.end(biographyHtml({
+        name: 'Beta',
+        surname: 'Person',
+        birth: '1910-01-01',
+        death: '1990-01-01',
+        activities: ['test'],
+        description: 'Beta biography.'
+      }));
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end('Not found');
+  });
+
+  await new Promise((resolve) => server.listen(0, resolve));
+  const { port } = server.address();
+
+  try {
+    const result = await scrapeBiographies({
+      baseUrl: `http://127.0.0.1:${port}/Search/Type,Biography/Initial,A/`,
+      initials: ['A', 'B'],
+      delayMs: 0,
+      timeoutMs: 5000,
+      fetchDetails: true,
+      detailsDelayMs: 0,
+      detailConcurrency: 4
+    });
+
+    assert.equal(result.scrapedPages, 2);
+    assert.equal(result.records.length, 2);
+    assert.equal(result.duplicateRecords, 1);
+    assert.equal(result.records[0].biography_name, 'Shared Person');
+    assert.equal(result.records[1].biography_text, 'Beta biography.');
+    assert.equal(duplicateDetailRequests, 1);
+  } finally {
+    server.close();
+  }
+});
+
+test('scrapeBiographies resumes from existing records and skips completed biographies', async () => {
+  let sharedDetailRequests = 0;
+  let betaDetailRequests = 0;
+
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+
+    if (req.method === 'GET' && req.url === '/Search/Type,Biography/Initial,A/') {
+      res.end(pageHtml({
+        currentPage: 1,
+        pagerLabels: [{ label: '1', current: true }],
+        biographies: [
+          { url: '/a/biografia/shared', name: 'Shared A', dates: '1900-1980', activities: ['test'] },
+          { url: '/a/biografia/beta', name: 'Beta', dates: '1910-1990', activities: ['test'] }
+        ]
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/a/biografia/shared') {
+      sharedDetailRequests += 1;
+      res.end(biographyHtml({
+        name: 'Shared',
+        surname: 'Person',
+        birth: '1900-01-01',
+        death: '1980-01-01',
+        activities: ['test'],
+        description: 'Shared biography from network.'
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/a/biografia/beta') {
+      betaDetailRequests += 1;
+      res.end(biographyHtml({
+        name: 'Beta',
+        surname: 'Person',
+        birth: '1910-01-01',
+        death: '1990-01-01',
+        activities: ['test'],
+        description: 'Beta biography from network.'
+      }));
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end('Not found');
+  });
+
+  await new Promise((resolve) => server.listen(0, resolve));
+  const { port } = server.address();
+  const root = `http://127.0.0.1:${port}`;
+
+  try {
+    const progressSnapshots = [];
+    const result = await scrapeBiographies({
+      baseUrl: `${root}/Search/Type,Biography/Initial,A/`,
+      delayMs: 0,
+      timeoutMs: 5000,
+      fetchDetails: true,
+      detailsDelayMs: 0,
+      existingRecords: [
+        {
+          url: `${root}/a/biografia/shared`,
+          name: 'Shared A',
+          dates: '1900-1980',
+          activity: 'test',
+          biography_text: 'Shared biography from CSV.'
+        },
+        {
+          url: `${root}/a/biografia/beta`,
+          name: 'Beta',
+          dates: '1910-1990',
+          activity: 'test'
+        }
+      ],
+      onProgress: async ({ records }) => {
+        progressSnapshots.push(records.length);
+      }
+    });
+
+    assert.equal(result.records.length, 2);
+    assert.equal(result.skippedRecords, 1);
+    assert.equal(sharedDetailRequests, 0);
+    assert.equal(betaDetailRequests, 1);
+    assert.equal(result.records.find((row) => row.name === 'Shared A').biography_text, 'Shared biography from CSV.');
+    assert.equal(result.records.find((row) => row.name === 'Beta').biography_text, 'Beta biography from network.');
+    assert.deepEqual(progressSnapshots, [2]);
+  } finally {
+    server.close();
+  }
+});
