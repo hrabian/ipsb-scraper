@@ -108,19 +108,101 @@ function extractBiographyDetails($, biographyUrl) {
   };
 }
 
+const CSV_COLUMNS = [
+  'url',
+  'name',
+  'dates',
+  'activity',
+  'biography_url',
+  'biography_name',
+  'biography_birth_date',
+  'biography_death_date',
+  'biography_activities',
+  'biography_text',
+  'biography_error'
+];
+
+function getRecordKey(row) {
+  return normalizeText(row.url || row.biography_url || row.name).toLowerCase();
+}
+
+function dedupeRecords(records) {
+  const byKey = new Map();
+
+  for (const record of records) {
+    const key = getRecordKey(record);
+    if (!key) {
+      continue;
+    }
+
+    byKey.set(key, { ...(byKey.get(key) || {}), ...record });
+  }
+
+  return [...byKey.values()];
+}
+
+function parseCsv(csv) {
+  const rows = [];
+  let field = '';
+  let row = [];
+  let inQuotes = false;
+
+  for (let i = 0; i < csv.length; i += 1) {
+    const char = csv[i];
+    const next = csv[i + 1];
+
+    if (inQuotes) {
+      if (char === '"' && next === '"') {
+        field += '"';
+        i += 1;
+      } else if (char === '"') {
+        inQuotes = false;
+      } else {
+        field += char;
+      }
+    } else if (char === '"') {
+      inQuotes = true;
+    } else if (char === ',') {
+      row.push(field);
+      field = '';
+    } else if (char === '\n') {
+      row.push(field);
+      rows.push(row);
+      field = '';
+      row = [];
+    } else if (char !== '\r') {
+      field += char;
+    }
+  }
+
+  if (field || row.length) {
+    row.push(field);
+    rows.push(row);
+  }
+
+  if (rows.length === 0) {
+    return [];
+  }
+
+  const headers = rows[0];
+  return rows.slice(1).filter((values) => values.some(Boolean)).map((values) => Object.fromEntries(headers.map((header, index) => [header, values[index] || ''])));
+}
+
+async function loadExistingRecords(outputPath) {
+  try {
+    const csv = await fs.readFile(outputPath, 'utf8');
+    return dedupeRecords(parseCsv(csv));
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return [];
+    }
+    throw error;
+  }
+}
+
 function toCsv(data) {
   const preferred = [
-    'url',
-    'name',
-    'dates',
-    'activity',
-    'biography_url',
-    'biography_name',
-    'biography_birth_date',
-    'biography_death_date',
-    'biography_activities',
-    'biography_text',
-    'biography_error'
+    ...CSV_COLUMNS
   ];
 
   const discovered = [...new Set(data.flatMap((row) => Object.keys(row)))];
@@ -367,10 +449,12 @@ async function mapWithConcurrency(items, worker, concurrency) {
   return results;
 }
 
-async function enrichWithBiographyPages({ rows, timeoutMs, delayMs, cookies, detailConcurrency }) {
-  const uniqueRows = [...new Map(rows.filter((row) => row.url).map((row) => [row.url, row])).values()];
+async function enrichWithBiographyPages({ rows, timeoutMs, delayMs, cookies, detailConcurrency, existingRecords = [] }) {
+  const existingByUrl = new Map(existingRecords.filter((row) => row.url).map((row) => [row.url, row]));
+  const uniqueRows = [...new Map(rows.filter((row) => row.url).map((row) => [row.url, row])).values()]
+    .filter((row) => !existingByUrl.has(row.url) || !existingByUrl.get(row.url).biography_text);
 
-  const detailsByUrl = new Map();
+  const detailsByUrl = new Map(existingRecords.filter((row) => row.url).map((row) => [row.url, row]));
 
   await mapWithConcurrency(
     uniqueRows,
@@ -412,7 +496,8 @@ async function scrapeBiographies({
   detailsDelayMs = 300,
   detailConcurrency = 3,
   initials,
-  discoverInitials = false
+  discoverInitials = false,
+  existingRecords = []
 }) {
   const first = await fetchHtml(baseUrl, { timeoutMs });
   const firstPage = cheerio.load(first.html);
@@ -421,7 +506,7 @@ async function scrapeBiographies({
     : buildInitialUrls(baseUrl, initials);
   const urlsToScrape = initialUrls.length ? initialUrls : [baseUrl];
 
-  const allRecords = [];
+  const allRecords = [...existingRecords];
   let totalPages = 0;
   let scrapedPages = 0;
   let latestCookies = first.cookies;
@@ -457,14 +542,15 @@ async function scrapeBiographies({
         timeoutMs,
         delayMs: detailsDelayMs,
         cookies: latestCookies,
-        detailConcurrency
+        detailConcurrency,
+        existingRecords
       })
     : allRecords;
 
   return {
     totalPages,
     scrapedPages,
-    records
+    records: dedupeRecords(records)
   };
 }
 
@@ -484,11 +570,20 @@ async function main() {
           .split(',')
           .map((x) => x.trim())
           .filter(Boolean),
-    discoverInitials: process.env.INITIALS === 'discover'
+    discoverInitials: process.env.INITIALS === 'discover',
+    resume: process.env.RESUME === 'false' ? false : true
   };
 
   try {
-    const { totalPages, scrapedPages, records } = await scrapeBiographies(options);
+    const existingRecords = options.resume ? await loadExistingRecords(options.outputPath) : [];
+    if (existingRecords.length) {
+      console.log(`Loaded ${existingRecords.length} unique records from existing CSV for resume/deduplication`);
+    }
+
+    const { totalPages, scrapedPages, records } = await scrapeBiographies({
+      ...options,
+      existingRecords
+    });
     await fs.writeFile(options.outputPath, toCsv(records), 'utf8');
 
     console.log(`Total pages available: ${totalPages}`);
@@ -520,5 +615,8 @@ module.exports = {
   getPaginationTargets,
   scrapeBiographies,
   toCsv,
+  parseCsv,
+  dedupeRecords,
+  loadExistingRecords,
   updateCookies
 };

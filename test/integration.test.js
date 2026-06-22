@@ -302,10 +302,87 @@ test('scrapeBiographies can scrape more than one initial and fetch duplicate det
     });
 
     assert.equal(result.scrapedPages, 2);
-    assert.equal(result.records.length, 3);
+    assert.equal(result.records.length, 2);
     assert.equal(result.records[0].biography_name, 'Shared Person');
-    assert.equal(result.records[2].biography_text, 'Beta biography.');
+    assert.equal(result.records[1].biography_text, 'Beta biography.');
     assert.equal(duplicateDetailRequests, 1);
+  } finally {
+    server.close();
+  }
+});
+
+test('scrapeBiographies resumes from existing records and skips already enriched details', async () => {
+  let oldDetailRequests = 0;
+  let newDetailRequests = 0;
+
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+
+    if (req.method === 'GET' && req.url === '/Search/Type,Biography/Initial,A/') {
+      res.end(pageHtml({
+        currentPage: 1,
+        pagerLabels: [{ label: '1', current: true }],
+        biographies: [
+          { url: '/a/biografia/old', name: 'Old', dates: '1900-1980', activities: ['test'] },
+          { url: '/a/biografia/new', name: 'New', dates: '1910-1990', activities: ['test'] }
+        ]
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/a/biografia/old') {
+      oldDetailRequests += 1;
+      res.end(biographyHtml({
+        name: 'Old',
+        surname: 'Person',
+        birth: '1900-01-01',
+        death: '1980-01-01',
+        activities: ['test'],
+        description: 'Should not be fetched again.'
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/a/biografia/new') {
+      newDetailRequests += 1;
+      res.end(biographyHtml({
+        name: 'New',
+        surname: 'Person',
+        birth: '1910-01-01',
+        death: '1990-01-01',
+        activities: ['test'],
+        description: 'Fetched after resume.'
+      }));
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end('Not found');
+  });
+
+  await new Promise((resolve) => server.listen(0, resolve));
+  const { port } = server.address();
+  const oldUrl = `http://127.0.0.1:${port}/a/biografia/old`;
+
+  try {
+    const result = await scrapeBiographies({
+      baseUrl: `http://127.0.0.1:${port}/Search/Type,Biography/Initial,A/`,
+      delayMs: 0,
+      timeoutMs: 5000,
+      fetchDetails: true,
+      detailsDelayMs: 0,
+      existingRecords: [{
+        url: oldUrl,
+        name: 'Old existing',
+        biography_text: 'Already saved.'
+      }]
+    });
+
+    assert.equal(result.records.length, 2);
+    assert.equal(result.records.find((row) => row.url === oldUrl).biography_text, 'Already saved.');
+    assert.equal(result.records.find((row) => row.name === 'New').biography_text, 'Fetched after resume.');
+    assert.equal(oldDetailRequests, 0);
+    assert.equal(newDetailRequests, 1);
   } finally {
     server.close();
   }

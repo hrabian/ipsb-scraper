@@ -147,3 +147,21 @@ test('extractInitialUrls discovers unique initial links and buildInitialUrls rep
     'https://www.ipsb.nina.gov.pl/Search/Type,Biography/Initial,%C5%81/'
   ]);
 });
+
+test('parseCsv and dedupeRecords detect duplicate CSV rows by URL and merge newest data', () => {
+  const {
+    parseCsv,
+    dedupeRecords
+  } = require('../scraper');
+
+  const parsed = parseCsv('url,name,biography_text\nhttps://x/a,Old,"old, text"\nhttps://x/a,New,new text\n');
+  const deduped = dedupeRecords(parsed);
+
+  assert.equal(parsed.length, 2);
+  assert.equal(deduped.length, 1);
+  assert.deepEqual(deduped[0], {
+    url: 'https://x/a',
+    name: 'New',
+    biography_text: 'new text'
+  });
+});
