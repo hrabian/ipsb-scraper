@@ -1,8 +1,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const fsp = require('node:fs/promises');
 const http = require('node:http');
+const os = require('node:os');
+const path = require('node:path');
 
-const { scrapeBiographies } = require('../scraper');
+const { scrapeBiographies, saveRecords } = require('../scraper');
 
 function pageHtml({ currentPage, pagerLabels, biographies }) {
   const pager = pagerLabels
@@ -385,5 +389,124 @@ test('scrapeBiographies resumes from existing records and skips already enriched
     assert.equal(newDetailRequests, 1);
   } finally {
     server.close();
+  }
+});
+
+test('scrapeBiographies refetches resume records that are missing biography details', async () => {
+  let incompleteDetailRequests = 0;
+
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+
+    if (req.method === 'GET' && req.url === '/Search/Type,Biography/Initial,A/') {
+      res.end(pageHtml({
+        currentPage: 1,
+        pagerLabels: [{ label: '1', current: true }],
+        biographies: [
+          { url: '/a/biografia/incomplete', name: 'Incomplete', dates: '1900-1980', activities: ['test'] }
+        ]
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/a/biografia/incomplete') {
+      incompleteDetailRequests += 1;
+      res.end(biographyHtml({
+        name: 'Incomplete',
+        surname: 'Person',
+        birth: '1900-01-01',
+        death: '1980-01-01',
+        activities: ['test'],
+        description: 'Fetched missing details.'
+      }));
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end('Not found');
+  });
+
+  await new Promise((resolve) => server.listen(0, resolve));
+  const { port } = server.address();
+  const incompleteUrl = `http://127.0.0.1:${port}/a/biografia/incomplete`;
+
+  try {
+    const result = await scrapeBiographies({
+      baseUrl: `http://127.0.0.1:${port}/Search/Type,Biography/Initial,A/`,
+      delayMs: 0,
+      timeoutMs: 5000,
+      fetchDetails: true,
+      detailsDelayMs: 0,
+      existingRecords: [{
+        url: incompleteUrl,
+        name: 'Incomplete existing'
+      }]
+    });
+
+    assert.equal(result.records.length, 1);
+    assert.equal(result.records[0].biography_text, 'Fetched missing details.');
+    assert.equal(incompleteDetailRequests, 1);
+  } finally {
+    server.close();
+  }
+});
+
+test('scrapeBiographies writes a checkpoint before fetching biography details', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'ipsb-checkpoint-'));
+  const outputPath = path.join(tempDir, 'biography_data.csv');
+  let checkpointExistedBeforeDetails = false;
+
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+
+    if (req.method === 'GET' && req.url === '/Search/Type,Biography/Initial,A/') {
+      res.end(pageHtml({
+        currentPage: 1,
+        pagerLabels: [{ label: '1', current: true }],
+        biographies: [
+          { url: '/a/biografia/checkpoint', name: 'Checkpoint', dates: '1900-1980', activities: ['test'] }
+        ]
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/a/biografia/checkpoint') {
+      checkpointExistedBeforeDetails = fs.existsSync(outputPath)
+        && fs.readFileSync(outputPath, 'utf8').includes('Checkpoint');
+      res.end(biographyHtml({
+        name: 'Checkpoint',
+        surname: 'Person',
+        birth: '1900-01-01',
+        death: '1980-01-01',
+        activities: ['test'],
+        description: 'Checkpoint details.'
+      }));
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end('Not found');
+  });
+
+  await new Promise((resolve) => server.listen(0, resolve));
+  const { port } = server.address();
+
+  try {
+    const result = await scrapeBiographies({
+      baseUrl: `http://127.0.0.1:${port}/Search/Type,Biography/Initial,A/`,
+      delayMs: 0,
+      timeoutMs: 5000,
+      fetchDetails: true,
+      detailsDelayMs: 0,
+      onProgress: (records) => saveRecords(outputPath, records)
+    });
+
+    const finalCsv = await fsp.readFile(outputPath, 'utf8');
+    assert.equal(result.records.length, 1);
+    assert.equal(checkpointExistedBeforeDetails, true);
+    assert.match(finalCsv, /Checkpoint details\./);
+  } finally {
+    server.close();
+    await fsp.rm(tempDir, { recursive: true, force: true });
   }
 });

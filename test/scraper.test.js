@@ -123,6 +123,25 @@ test('toCsv escapes commas and quotes and keeps biography columns', () => {
   assert.match(csv.split('\n')[0], /biography_name/);
 });
 
+test('toCsv creates a complete header row for empty checkpoints', () => {
+  const csv = toCsv([]);
+  const headers = csv.split('\n')[0].split(',');
+
+  assert.deepEqual(headers, [
+    'url',
+    'name',
+    'dates',
+    'activity',
+    'biography_url',
+    'biography_name',
+    'biography_birth_date',
+    'biography_death_date',
+    'biography_activities',
+    'biography_text',
+    'biography_error'
+  ]);
+});
+
 test('updateCookies keeps full cookie values including "="', () => {
   const updated = updateCookies(['token=abc=123'], ['session=new=value; Path=/; HttpOnly']);
   assert.deepEqual(updated.sort(), ['session=new=value', 'token=abc=123'].sort());
