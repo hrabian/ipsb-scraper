@@ -10,7 +10,11 @@ const {
   parseAspNetState,
   getPaginationTargets,
   toCsv,
-  updateCookies
+  parseCsv,
+  dedupeRecords,
+  updateCookies,
+  extractInitialUrls,
+  buildInitialUrls
 } = require('../scraper');
 
 test('extractTotalPages returns highest visible page number from links and span', () => {
@@ -121,7 +125,54 @@ test('toCsv escapes commas and quotes and keeps biography columns', () => {
   assert.match(csv.split('\n')[0], /biography_name/);
 });
 
+test('parseCsv reads escaped values and dedupeRecords keeps enriched duplicates', () => {
+  const csv = toCsv([
+    {
+      url: 'https://x/y',
+      name: 'Jan "X"',
+      dates: '1900,1980',
+      biography_name: ''
+    },
+    {
+      url: 'https://x/y',
+      name: 'Jan X',
+      dates: '1900,1980',
+      biography_name: 'Jan X',
+      biography_text: 'Opis'
+    }
+  ]);
+
+  const parsed = parseCsv(csv);
+  assert.equal(parsed[0].name, 'Jan "X"');
+  assert.equal(parsed[0].dates, '1900,1980');
+
+  const deduped = dedupeRecords(parsed);
+  assert.equal(deduped.duplicates, 1);
+  assert.equal(deduped.records.length, 1);
+  assert.equal(deduped.records[0].biography_text, 'Opis');
+});
+
 test('updateCookies keeps full cookie values including "="', () => {
   const updated = updateCookies(['token=abc=123'], ['session=new=value; Path=/; HttpOnly']);
   assert.deepEqual(updated.sort(), ['session=new=value', 'token=abc=123'].sort());
+});
+
+test('extractInitialUrls discovers unique initial links and buildInitialUrls replaces current initial', () => {
+  const $ = cheerio.load(`
+    <div class="alphabet">
+      <a href="/Search/Type,Biography/Initial,A/">A</a>
+      <a href="/Search/Type,Biography/Initial,B/">B</a>
+      <a href="/Search/Type,Biography/Initial,A/">A duplicate</a>
+    </div>
+  `);
+
+  assert.deepEqual(extractInitialUrls($, 'https://www.ipsb.nina.gov.pl/Search/Type,Biography/Initial,A/'), [
+    'https://www.ipsb.nina.gov.pl/Search/Type,Biography/Initial,A/',
+    'https://www.ipsb.nina.gov.pl/Search/Type,Biography/Initial,B/'
+  ]);
+
+  assert.deepEqual(buildInitialUrls('https://www.ipsb.nina.gov.pl/Search/Type,Biography/Initial,A/', ['A', 'Ł']), [
+    'https://www.ipsb.nina.gov.pl/Search/Type,Biography/Initial,A/',
+    'https://www.ipsb.nina.gov.pl/Search/Type,Biography/Initial,%C5%81/'
+  ]);
 });
