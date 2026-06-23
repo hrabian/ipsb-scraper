@@ -5,7 +5,8 @@
   "main": "scraper.js",
   "scripts": {
     "test": "node --test",
-    "scrape": "node scraper.js"
+    "scrape": "node scraper.js",
+    "suggest:wikidata": "node wikidata-occupation-suggester.js"
   },
   "keywords": [],
   "author": "",

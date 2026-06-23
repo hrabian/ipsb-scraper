@@ -33,6 +33,22 @@ Useful environment variables:
 | `MAX_PAGES` | unset | Optional page limit for testing. |
 | `FETCH_DETAILS` | `true` | Set to `false` to skip biography detail pages. |
 
+## Wikidata occupation suggestions
+
+Generate candidate Wikidata `occupation` (`P106`) statements from scraped IPSB rows by reading the CSV `activity` column and attaching the IPSB biography URL as a reference URL (`P854`):
+
+```bash
+npm run suggest:wikidata -- --input biography_data.csv --output wikidata_occupation_suggestions.csv
+```
+
+If the CSV contains a Wikidata item column, export QuickStatements instead:
+
+```bash
+npm run suggest:wikidata -- --input biography_data.csv --output wikidata_occupations.qs --format quickstatements --qid-column wikidata_qid
+```
+
+The suggester is a local, deterministic, seed-trained classifier. Review suggestions before importing them to Wikidata.
+
 ## Conflict checks
 
 The test suite includes a pre-flight check that fails if tracked text files contain unresolved Git conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`). Run it with:
