@@ -1,8 +1,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const fsp = require('node:fs/promises');
 const http = require('node:http');
+const os = require('node:os');
+const path = require('node:path');
 
-const { scrapeBiographies } = require('../scraper');
+const { scrapeBiographies, saveRecords } = require('../scraper');
 
 function pageHtml({ currentPage, pagerLabels, biographies }) {
   const pager = pagerLabels
@@ -383,6 +387,226 @@ test('scrapeBiographies resumes from existing records and skips already enriched
     assert.equal(result.records.find((row) => row.name === 'New').biography_text, 'Fetched after resume.');
     assert.equal(oldDetailRequests, 0);
     assert.equal(newDetailRequests, 1);
+  } finally {
+    server.close();
+  }
+});
+
+test('scrapeBiographies refetches resume records that are missing biography details', async () => {
+  let incompleteDetailRequests = 0;
+
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+
+    if (req.method === 'GET' && req.url === '/Search/Type,Biography/Initial,A/') {
+      res.end(pageHtml({
+        currentPage: 1,
+        pagerLabels: [{ label: '1', current: true }],
+        biographies: [
+          { url: '/a/biografia/incomplete', name: 'Incomplete', dates: '1900-1980', activities: ['test'] }
+        ]
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/a/biografia/incomplete') {
+      incompleteDetailRequests += 1;
+      res.end(biographyHtml({
+        name: 'Incomplete',
+        surname: 'Person',
+        birth: '1900-01-01',
+        death: '1980-01-01',
+        activities: ['test'],
+        description: 'Fetched missing details.'
+      }));
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end('Not found');
+  });
+
+  await new Promise((resolve) => server.listen(0, resolve));
+  const { port } = server.address();
+  const incompleteUrl = `http://127.0.0.1:${port}/a/biografia/incomplete`;
+
+  try {
+    const result = await scrapeBiographies({
+      baseUrl: `http://127.0.0.1:${port}/Search/Type,Biography/Initial,A/`,
+      delayMs: 0,
+      timeoutMs: 5000,
+      fetchDetails: true,
+      detailsDelayMs: 0,
+      existingRecords: [{
+        url: incompleteUrl,
+        name: 'Incomplete existing'
+      }]
+    });
+
+    assert.equal(result.records.length, 1);
+    assert.equal(result.records[0].biography_text, 'Fetched missing details.');
+    assert.equal(incompleteDetailRequests, 1);
+  } finally {
+    server.close();
+  }
+});
+
+test('scrapeBiographies writes a checkpoint before fetching biography details', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'ipsb-checkpoint-'));
+  const outputPath = path.join(tempDir, 'biography_data.csv');
+  let checkpointExistedBeforeDetails = false;
+
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+
+    if (req.method === 'GET' && req.url === '/Search/Type,Biography/Initial,A/') {
+      res.end(pageHtml({
+        currentPage: 1,
+        pagerLabels: [{ label: '1', current: true }],
+        biographies: [
+          { url: '/a/biografia/checkpoint', name: 'Checkpoint', dates: '1900-1980', activities: ['test'] }
+        ]
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/a/biografia/checkpoint') {
+      checkpointExistedBeforeDetails = fs.existsSync(outputPath)
+        && fs.readFileSync(outputPath, 'utf8').includes('Checkpoint');
+      res.end(biographyHtml({
+        name: 'Checkpoint',
+        surname: 'Person',
+        birth: '1900-01-01',
+        death: '1980-01-01',
+        activities: ['test'],
+        description: 'Checkpoint details.'
+      }));
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end('Not found');
+  });
+
+  await new Promise((resolve) => server.listen(0, resolve));
+  const { port } = server.address();
+
+  try {
+    const result = await scrapeBiographies({
+      baseUrl: `http://127.0.0.1:${port}/Search/Type,Biography/Initial,A/`,
+      delayMs: 0,
+      timeoutMs: 5000,
+      fetchDetails: true,
+      detailsDelayMs: 0,
+      onProgress: (records) => saveRecords(outputPath, records)
+    });
+
+    const finalCsv = await fsp.readFile(outputPath, 'utf8');
+    assert.equal(result.records.length, 1);
+    assert.equal(checkpointExistedBeforeDetails, true);
+    assert.match(finalCsv, /Checkpoint details\./);
+  } finally {
+    server.close();
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('scrapeBiographies resumes listing from the saved page state', async () => {
+  let initialGetRequests = 0;
+  let postRequests = 0;
+  const completedStates = [];
+
+  const savedPage2 = pageHtml({
+    currentPage: 2,
+    pagerLabels: [
+      { label: '1', id: 'pager_1' },
+      { label: '2', current: true },
+      { label: '3', id: 'pager_3' }
+    ],
+    biographies: [
+      { url: '/a/biografia/person-2', name: 'Person 2', dates: '1900-1980', activities: ['test'] }
+    ]
+  });
+
+  const page3 = pageHtml({
+    currentPage: 3,
+    pagerLabels: [
+      { label: '2', id: 'pager_2' },
+      { label: '3', current: true }
+    ],
+    biographies: [
+      { url: '/a/biografia/person-3', name: 'Person 3', dates: '1900-1980', activities: ['test'] }
+    ]
+  });
+
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+
+    if (req.method === 'GET' && req.url === '/Search/Type,Biography/Initial,A/') {
+      initialGetRequests += 1;
+      res.statusCode = 500;
+      res.end('Should resume from saved HTML instead of fetching page 1');
+      return;
+    }
+
+    if (req.method === 'POST' && req.url === '/Search/Type,Biography/Initial,A/') {
+      postRequests += 1;
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => {
+        const params = new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+        assert.equal(params.get('PRADO_POSTBACK_TARGET'), 'pager$3');
+        res.end(page3);
+      });
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end('Not found');
+  });
+
+  await new Promise((resolve) => server.listen(0, resolve));
+  const { port } = server.address();
+  const baseUrl = `http://127.0.0.1:${port}/Search/Type,Biography/Initial,A/`;
+
+  try {
+    const result = await scrapeBiographies({
+      baseUrl,
+      delayMs: 0,
+      timeoutMs: 5000,
+      maxPages: 3,
+      fetchDetails: false,
+      existingRecords: [
+        {
+          url: `http://127.0.0.1:${port}/a/biografia/person-1`,
+          name: 'Person 1'
+        },
+        {
+          url: `http://127.0.0.1:${port}/a/biografia/person-2`,
+          name: 'Person 2'
+        }
+      ],
+      resumeState: {
+        initials: {
+          [baseUrl]: {
+            lastPage: 2,
+            html: savedPage2,
+            cookies: []
+          }
+        }
+      },
+      onStateProgress: (state) => {
+        completedStates.push(state);
+      }
+    });
+
+    assert.equal(initialGetRequests, 0);
+    assert.equal(postRequests, 1);
+    assert.equal(result.scrapedPages, 1);
+    assert.equal(result.records.length, 3);
+    assert.equal(result.records.at(-1).name, 'Person 3');
+    assert.equal(completedStates.at(-1).completed, true);
+    assert.equal(completedStates.at(-1).page, 3);
   } finally {
     server.close();
   }
