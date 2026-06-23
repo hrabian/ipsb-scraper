@@ -206,10 +206,12 @@ function toCsv(data) {
   ];
 
   const discovered = [...new Set(data.flatMap((row) => Object.keys(row)))];
-  const headers = [
-    ...preferred.filter((key) => discovered.includes(key)),
-    ...discovered.filter((key) => !preferred.includes(key))
-  ];
+  const headers = data.length
+    ? [
+        ...preferred.filter((key) => discovered.includes(key)),
+        ...discovered.filter((key) => !preferred.includes(key))
+      ]
+    : preferred;
 
   const escapeCsv = (value) => {
     const text = String(value ?? '');
@@ -221,6 +223,34 @@ function toCsv(data) {
 
   const rows = data.map((row) => headers.map((h) => escapeCsv(row[h])).join(','));
   return [headers.join(','), ...rows].join('\n');
+}
+
+async function saveRecords(outputPath, records) {
+  await fs.writeFile(outputPath, toCsv(dedupeRecords(records)), 'utf8');
+}
+
+function getDefaultStatePath(outputPath) {
+  return `${outputPath}.state.json`;
+}
+
+async function loadScrapeState(statePath) {
+  try {
+    const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    return {
+      initials: {},
+      ...state,
+      initials: state.initials || {}
+    };
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return { initials: {} };
+    }
+    throw error;
+  }
+}
+
+async function saveScrapeState(statePath, state) {
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
 }
 
 function getPostbackTargetFromId(id) {
@@ -375,28 +405,49 @@ function buildPostbackBody(state, targetId) {
   return body.toString();
 }
 
-async function scrapeViaPostback({ baseUrl, delayMs, maxPages, timeoutMs, firstHtml, firstCookies }) {
+async function scrapeViaPostback({
+  baseUrl,
+  delayMs,
+  maxPages,
+  timeoutMs,
+  firstHtml,
+  firstCookies,
+  startPage = 1,
+  onRecords,
+  onPageState
+}) {
   let html = firstHtml;
   let cookies = firstCookies;
   let $ = cheerio.load(html);
   const pageLimit = maxPages && maxPages > 0 ? maxPages : Infinity;
   let totalPages = extractTotalPages($);
-  let scrapedPages = 1;
+  let currentPage = Math.max(1, Number.parseInt(startPage, 10) || 1);
+  let scrapedPages = startPage > 1 ? 0 : 1;
   const records = [];
 
-  records.push(...extractBiographyItems($, baseUrl));
-  console.log(`Scraped page 1/${Number.isFinite(pageLimit) ? pageLimit : '?'} (${records.length} cumulative records)`);
+  if (currentPage === 1) {
+    records.push(...extractBiographyItems($, baseUrl));
+    console.log(`Scraped page 1/${Number.isFinite(pageLimit) ? pageLimit : '?'} (${records.length} cumulative records)`);
+    if (onRecords) {
+      await onRecords(records);
+    }
+    if (onPageState) {
+      await onPageState({ page: currentPage, totalPages, html, cookies });
+    }
+  } else {
+    console.log(`Resuming ${baseUrl} from saved page ${currentPage}`);
+  }
 
-  for (let targetPage = 2; targetPage <= pageLimit; targetPage += 1) {
+  for (let targetPage = currentPage + 1; targetPage <= pageLimit; targetPage += 1) {
     let reachedTargetPage = false;
 
     while (!reachedTargetPage) {
       const { numeric, nextId } = getPaginationTargets($);
-      totalPages = Math.max(totalPages, ...numeric.keys(), scrapedPages);
+      totalPages = Math.max(totalPages, ...numeric.keys(), currentPage);
 
       const pageLinkId = numeric.get(targetPage) || nextId;
       if (!pageLinkId) {
-        return { totalPages: Math.max(totalPages, scrapedPages), scrapedPages, records, cookies };
+        return { totalPages: Math.max(totalPages, currentPage), scrapedPages, records, cookies, html, currentPage };
       }
 
       const state = parseAspNetState($);
@@ -411,26 +462,34 @@ async function scrapeViaPostback({ baseUrl, delayMs, maxPages, timeoutMs, firstH
       html = response.html;
       cookies = response.cookies;
       $ = cheerio.load(html);
-      totalPages = Math.max(totalPages, extractTotalPages($), scrapedPages);
+      totalPages = Math.max(totalPages, extractTotalPages($), currentPage);
       reachedTargetPage = extractCurrentPage($) === targetPage || Boolean(numeric.get(targetPage));
     }
 
-    scrapedPages = targetPage;
+    currentPage = targetPage;
+    scrapedPages += 1;
 
     const pageItems = extractBiographyItems($, baseUrl);
     records.push(...pageItems);
     console.log(`Scraped page ${targetPage}/${Number.isFinite(pageLimit) ? pageLimit : '?'} (${pageItems.length} records)`);
+    if (onRecords) {
+      await onRecords(records);
+    }
+    if (onPageState) {
+      await onPageState({ page: currentPage, totalPages, html, cookies });
+    }
 
     if (targetPage < pageLimit && delayMs > 0) {
       await sleep(delayMs);
     }
   }
 
-  return { totalPages, scrapedPages, records, cookies };
+  return { totalPages, scrapedPages, records, cookies, html, currentPage };
 }
 
 async function mapWithConcurrency(items, worker, concurrency) {
   const safeConcurrency = Math.max(1, Number.parseInt(concurrency, 10) || 1);
+  const workerCount = Math.min(safeConcurrency, items.length);
   const results = new Array(items.length);
   let nextIndex = 0;
 
@@ -445,16 +504,39 @@ async function mapWithConcurrency(items, worker, concurrency) {
     }
   }
 
-  await Promise.all(Array.from({ length: safeConcurrency }, () => runWorker()));
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
   return results;
 }
 
-async function enrichWithBiographyPages({ rows, timeoutMs, delayMs, cookies, detailConcurrency, existingRecords = [] }) {
-  const existingByUrl = new Map(existingRecords.filter((row) => row.url).map((row) => [row.url, row]));
-  const uniqueRows = [...new Map(rows.filter((row) => row.url).map((row) => [row.url, row])).values()]
-    .filter((row) => !existingByUrl.has(row.url) || !existingByUrl.get(row.url).biography_text);
+function hasBiographyDetails(row) {
+  return Boolean(row.biography_text || row.biography_error);
+}
 
-  const detailsByUrl = new Map(existingRecords.filter((row) => row.url).map((row) => [row.url, row]));
+async function enrichWithBiographyPages({
+  rows,
+  timeoutMs,
+  delayMs,
+  cookies,
+  detailConcurrency,
+  existingRecords = [],
+  onProgress
+}) {
+  const detailsByUrl = new Map();
+  for (const record of existingRecords) {
+    if (record.url && hasBiographyDetails(record)) {
+      detailsByUrl.set(record.url, record);
+    }
+  }
+
+  const seenRows = new Set();
+  const uniqueRows = [];
+  for (const row of rows) {
+    if (!row.url || seenRows.has(row.url) || detailsByUrl.has(row.url)) {
+      continue;
+    }
+    seenRows.add(row.url);
+    uniqueRows.push(row);
+  }
 
   await mapWithConcurrency(
     uniqueRows,
@@ -473,6 +555,12 @@ async function enrichWithBiographyPages({ rows, timeoutMs, delayMs, cookies, det
         detailsByUrl.set(row.url, extractBiographyDetails($, row.url));
       } catch (error) {
         detailsByUrl.set(row.url, { biography_url: row.url, biography_error: error.message });
+      }
+
+      if (onProgress) {
+        await onProgress(rows.map((currentRow) => (
+          currentRow.url ? { ...currentRow, ...detailsByUrl.get(currentRow.url) } : currentRow
+        )));
       }
 
       if (delayMs > 0) {
@@ -497,10 +585,13 @@ async function scrapeBiographies({
   detailConcurrency = 3,
   initials,
   discoverInitials = false,
-  existingRecords = []
+  existingRecords = [],
+  onProgress,
+  resumeState = { initials: {} },
+  onStateProgress
 }) {
-  const first = await fetchHtml(baseUrl, { timeoutMs });
-  const firstPage = cheerio.load(first.html);
+  const first = discoverInitials ? await fetchHtml(baseUrl, { timeoutMs }) : null;
+  const firstPage = first ? cheerio.load(first.html) : null;
   const initialUrls = discoverInitials
     ? extractInitialUrls(firstPage, baseUrl)
     : buildInitialUrls(baseUrl, initials);
@@ -509,12 +600,21 @@ async function scrapeBiographies({
   const allRecords = [...existingRecords];
   let totalPages = 0;
   let scrapedPages = 0;
-  let latestCookies = first.cookies;
+  let latestCookies = first ? first.cookies : [];
 
   for (const [index, initialUrl] of urlsToScrape.entries()) {
-    const initialFirst = index === 0 && initialUrl === baseUrl
-      ? first
+    const initialState = resumeState.initials?.[initialUrl];
+    if (initialState?.completed) {
+      totalPages += initialState.totalPages || 0;
+      console.log(`Skipping completed initial ${index + 1}/${urlsToScrape.length}: ${initialUrl}`);
+      continue;
+    }
+
+    const hasSavedPage = initialState?.html && initialState?.lastPage;
+    const initialFirst = hasSavedPage
+      ? { html: initialState.html, cookies: initialState.cookies || latestCookies }
       : await fetchHtml(initialUrl, { timeoutMs, cookies: latestCookies });
+    const startPage = hasSavedPage ? initialState.lastPage : 1;
 
     const listing = await scrapeViaPostback({
       baseUrl: initialUrl,
@@ -522,13 +622,39 @@ async function scrapeBiographies({
       maxPages,
       timeoutMs,
       firstHtml: initialFirst.html,
-      firstCookies: initialFirst.cookies
+      firstCookies: initialFirst.cookies,
+      startPage,
+      onRecords: onProgress
+        ? (currentInitialRecords) => onProgress([...allRecords, ...currentInitialRecords])
+        : undefined,
+      onPageState: onStateProgress
+        ? (pageState) => onStateProgress({
+            initialUrl,
+            initialIndex: index,
+            totalInitials: urlsToScrape.length,
+            completed: false,
+            ...pageState
+          })
+        : undefined
     });
 
     latestCookies = listing.cookies;
     totalPages += listing.totalPages;
     scrapedPages += listing.scrapedPages;
     allRecords.push(...listing.records);
+
+    if (onStateProgress) {
+      await onStateProgress({
+        initialUrl,
+        initialIndex: index,
+        totalInitials: urlsToScrape.length,
+        page: listing.currentPage,
+        totalPages: listing.totalPages,
+        html: listing.html,
+        cookies: latestCookies,
+        completed: true
+      });
+    }
 
     console.log(`Completed initial ${index + 1}/${urlsToScrape.length}: ${initialUrl}`);
     if (index < urlsToScrape.length - 1 && delayMs > 0) {
@@ -543,9 +669,14 @@ async function scrapeBiographies({
         delayMs: detailsDelayMs,
         cookies: latestCookies,
         detailConcurrency,
-        existingRecords
+        existingRecords,
+        onProgress
       })
     : allRecords;
+
+  if (onProgress) {
+    await onProgress(records);
+  }
 
   return {
     totalPages,
@@ -558,6 +689,7 @@ async function main() {
   const options = {
     baseUrl: process.env.BASE_URL || 'https://www.ipsb.nina.gov.pl/Search/Type,Biography/Initial,A/',
     outputPath: process.env.OUTPUT || 'biography_data.csv',
+    statePath: process.env.STATE_PATH || getDefaultStatePath(process.env.OUTPUT || 'biography_data.csv'),
     delayMs: Number.parseInt(process.env.DELAY_MS || '1200', 10),
     maxPages: process.env.MAX_PAGES ? Number.parseInt(process.env.MAX_PAGES, 10) : undefined,
     timeoutMs: Number.parseInt(process.env.TIMEOUT_MS || '30000', 10),
@@ -576,20 +708,45 @@ async function main() {
 
   try {
     const existingRecords = options.resume ? await loadExistingRecords(options.outputPath) : [];
+    const scrapeState = options.resume ? await loadScrapeState(options.statePath) : { initials: {} };
     if (existingRecords.length) {
       console.log(`Loaded ${existingRecords.length} unique records from existing CSV for resume/deduplication`);
     }
+    await saveRecords(options.outputPath, existingRecords);
+
+    let saveCheckpoint = Promise.resolve();
+    const queueCheckpoint = (records) => {
+      saveCheckpoint = saveCheckpoint.then(() => saveRecords(options.outputPath, records));
+      return saveCheckpoint;
+    };
+
+    let saveStateCheckpoint = Promise.resolve();
+    const queueStateCheckpoint = ({ initialUrl, ...progress }) => {
+      scrapeState.initials[initialUrl] = {
+        ...(scrapeState.initials[initialUrl] || {}),
+        ...progress,
+        lastPage: progress.page,
+        updatedAt: new Date().toISOString()
+      };
+      saveStateCheckpoint = saveStateCheckpoint.then(() => saveScrapeState(options.statePath, scrapeState));
+      return saveStateCheckpoint;
+    };
 
     const { totalPages, scrapedPages, records } = await scrapeBiographies({
       ...options,
-      existingRecords
+      existingRecords,
+      onProgress: queueCheckpoint,
+      resumeState: scrapeState,
+      onStateProgress: queueStateCheckpoint
     });
-    await fs.writeFile(options.outputPath, toCsv(records), 'utf8');
+    await queueCheckpoint(records);
+    await saveStateCheckpoint;
 
     console.log(`Total pages available: ${totalPages}`);
     console.log(`Pages scraped: ${scrapedPages}`);
     console.log(`Records saved: ${records.length}`);
     console.log(`Output file: ${options.outputPath}`);
+    console.log(`Resume state file: ${options.statePath}`);
   } catch (error) {
     console.error('Scraping failed:', error.message);
     if (process.env.DEBUG === '1' && error.stack) {
@@ -618,5 +775,9 @@ module.exports = {
   parseCsv,
   dedupeRecords,
   loadExistingRecords,
+  saveRecords,
+  getDefaultStatePath,
+  loadScrapeState,
+  saveScrapeState,
   updateCookies
 };
