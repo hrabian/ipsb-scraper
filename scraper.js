@@ -1,4 +1,6 @@
 const fs = require('fs/promises');
+const nodeFs = require('fs');
+const readline = require('readline');
 const cheerio = require('cheerio');
 
 const DEFAULT_HEADERS = {
@@ -141,7 +143,7 @@ function dedupeRecords(records) {
   return [...byKey.values()];
 }
 
-function parseCsv(csv) {
+function parseCsvRows(csv) {
   const rows = [];
   let field = '';
   let row = [];
@@ -180,12 +182,20 @@ function parseCsv(csv) {
     rows.push(row);
   }
 
+  return rows;
+}
+
+function parseCsv(csv) {
+  const rows = parseCsvRows(csv);
   if (rows.length === 0) {
     return [];
   }
 
   const headers = rows[0];
-  return rows.slice(1).filter((values) => values.some(Boolean)).map((values) => Object.fromEntries(headers.map((header, index) => [header, values[index] || ''])));
+  return rows
+    .slice(1)
+    .filter((values) => values.some(Boolean))
+    .map((values) => Object.fromEntries(headers.map((header, index) => [header, values[index] || ''])));
 }
 
 async function loadExistingRecords(outputPath) {
@@ -200,33 +210,211 @@ async function loadExistingRecords(outputPath) {
   }
 }
 
-function toCsv(data) {
+function escapeCsv(value) {
+  const text = String(value ?? '');
+  if (/[",\n]/.test(text)) {
+    return `"${text.replace(/"/g, '""')}"`;
+  }
+  return text;
+}
+
+function getCsvHeadersForData(data, baseHeaders = CSV_COLUMNS) {
   const preferred = [
     ...CSV_COLUMNS
   ];
 
   const discovered = [...new Set(data.flatMap((row) => Object.keys(row)))];
-  const headers = data.length
+  const base = [
+    ...preferred.filter((key) => baseHeaders.includes(key)),
+    ...baseHeaders.filter((key) => !preferred.includes(key))
+  ];
+
+  return data.length
     ? [
-        ...preferred.filter((key) => discovered.includes(key)),
-        ...discovered.filter((key) => !preferred.includes(key))
+        ...base.filter((key) => discovered.includes(key)),
+        ...discovered.filter((key) => !base.includes(key))
       ]
-    : preferred;
+    : base;
+}
 
-  const escapeCsv = (value) => {
-    const text = String(value ?? '');
-    if (/[",\n]/.test(text)) {
-      return `"${text.replace(/"/g, '""')}"`;
-    }
-    return text;
-  };
-
+function recordsToCsvLines(data, headers) {
   const rows = data.map((row) => headers.map((h) => escapeCsv(row[h])).join(','));
-  return [headers.join(','), ...rows].join('\n');
+  return rows.join('\n');
+}
+
+function toCsv(data) {
+  const headers = getCsvHeadersForData(data);
+  const rows = recordsToCsvLines(data, headers);
+  return rows ? `${headers.join(',')}\n${rows}` : headers.join(',');
 }
 
 async function saveRecords(outputPath, records) {
   await fs.writeFile(outputPath, toCsv(dedupeRecords(records)), 'utf8');
+}
+
+async function ensureCsvFile(outputPath) {
+  try {
+    const stat = await fs.stat(outputPath);
+    if (stat.size > 0) {
+      return;
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+
+  await fs.writeFile(outputPath, `${CSV_COLUMNS.join(',')}\n`, 'utf8');
+}
+
+async function readCsvHeaders(outputPath) {
+  try {
+    const handle = await fs.open(outputPath, 'r');
+    try {
+      const buffer = Buffer.alloc(64 * 1024);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      if (!bytesRead) {
+        return [];
+      }
+      const firstLine = buffer.toString('utf8', 0, bytesRead).split(/\r?\n/, 1)[0];
+      return parseCsvRows(`${firstLine}\n`)[0] || [];
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return [];
+    }
+    throw error;
+  }
+}
+
+async function appendRecords(outputPath, records) {
+  const rows = records.filter((record) => getRecordKey(record));
+  if (!rows.length) {
+    return;
+  }
+
+  await ensureCsvFile(outputPath);
+  const headers = await readCsvHeaders(outputPath);
+  await fs.appendFile(outputPath, `${recordsToCsvLines(rows, headers.length ? headers : CSV_COLUMNS)}\n`, 'utf8');
+}
+
+async function forEachCsvRecord(outputPath, onRecord, { end } = {}) {
+  let headers;
+  const streamOptions = {
+    encoding: 'utf8',
+    ...(typeof end === 'number' && end >= 0 ? { end } : {})
+  };
+  const stream = nodeFs.createReadStream(outputPath, streamOptions);
+  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+
+  for await (const line of lines) {
+    if (!headers) {
+      headers = parseCsvRows(`${line}\n`)[0] || [];
+      continue;
+    }
+    if (!line) {
+      continue;
+    }
+
+    const values = parseCsvRows(`${line}\n`)[0] || [];
+    if (!values.some(Boolean)) {
+      continue;
+    }
+
+    await onRecord(Object.fromEntries(headers.map((header, index) => [header, values[index] || ''])));
+  }
+}
+
+async function loadCsvProgress(outputPath) {
+  const progress = {
+    knownKeys: new Set(),
+    enrichedUrls: new Set(),
+    rowCount: 0
+  };
+
+  try {
+    await forEachCsvRecord(outputPath, async (row) => {
+      const key = getRecordKey(row);
+      if (key) {
+        progress.knownKeys.add(key);
+      }
+      if (row.url && hasBiographyDetails(row)) {
+        progress.enrichedUrls.add(row.url);
+      }
+      progress.rowCount += 1;
+    });
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+
+  return progress;
+}
+
+async function compactCsv(outputPath) {
+  await ensureCsvFile(outputPath);
+  const headers = await readCsvHeaders(outputPath);
+  const outputHeaders = headers.length ? headers : CSV_COLUMNS;
+  const rowsTempPath = `${outputPath}.compact.rows.tmp`;
+  const outputTempPath = `${outputPath}.compact.tmp`;
+  const latestByKey = new Map();
+  let rowsHandle;
+  let readHandle;
+  let writeHandle;
+  let offset = 0;
+
+  try {
+    rowsHandle = await fs.open(rowsTempPath, 'w');
+
+    await forEachCsvRecord(outputPath, async (row) => {
+      const key = getRecordKey(row);
+      if (!key) {
+        return;
+      }
+
+      const line = `${outputHeaders.map((header) => escapeCsv(row[header])).join(',')}\n`;
+      const buffer = Buffer.from(line, 'utf8');
+      await rowsHandle.write(buffer, 0, buffer.length, offset);
+      latestByKey.set(key, { offset, length: buffer.length });
+      offset += buffer.length;
+    });
+
+    await rowsHandle.close();
+    rowsHandle = undefined;
+
+    readHandle = await fs.open(rowsTempPath, 'r');
+    writeHandle = await fs.open(outputTempPath, 'w');
+    await writeHandle.write(`${outputHeaders.join(',')}\n`, null, 'utf8');
+
+    for (const location of latestByKey.values()) {
+      const buffer = Buffer.alloc(location.length);
+      await readHandle.read(buffer, 0, location.length, location.offset);
+      await writeHandle.write(buffer);
+    }
+
+    await readHandle.close();
+    readHandle = undefined;
+    await writeHandle.close();
+    writeHandle = undefined;
+
+    await fs.rename(outputTempPath, outputPath);
+    return { records: latestByKey.size };
+  } finally {
+    if (rowsHandle) {
+      await rowsHandle.close().catch(() => {});
+    }
+    if (readHandle) {
+      await readHandle.close().catch(() => {});
+    }
+    if (writeHandle) {
+      await writeHandle.close().catch(() => {});
+    }
+    await fs.rm(rowsTempPath, { force: true }).catch(() => {});
+    await fs.rm(outputTempPath, { force: true }).catch(() => {});
+  }
 }
 
 function getDefaultStatePath(outputPath) {
@@ -413,6 +601,8 @@ async function scrapeViaPostback({
   firstHtml,
   firstCookies,
   startPage = 1,
+  accumulateRecords = true,
+  onPageRecords,
   onRecords,
   onPageState
 }) {
@@ -426,8 +616,15 @@ async function scrapeViaPostback({
   const records = [];
 
   if (currentPage === 1) {
-    records.push(...extractBiographyItems($, baseUrl));
-    console.log(`Scraped page 1/${Number.isFinite(pageLimit) ? pageLimit : '?'} (${records.length} cumulative records)`);
+    const pageItems = extractBiographyItems($, baseUrl);
+    if (accumulateRecords) {
+      records.push(...pageItems);
+    }
+    if (onPageRecords) {
+      await onPageRecords(pageItems);
+    }
+    const recordLabel = accumulateRecords ? `${records.length} cumulative records` : `${pageItems.length} records`;
+    console.log(`Scraped page 1/${Number.isFinite(pageLimit) ? pageLimit : '?'} (${recordLabel})`);
     if (onRecords) {
       await onRecords(records);
     }
@@ -470,7 +667,12 @@ async function scrapeViaPostback({
     scrapedPages += 1;
 
     const pageItems = extractBiographyItems($, baseUrl);
-    records.push(...pageItems);
+    if (accumulateRecords) {
+      records.push(...pageItems);
+    }
+    if (onPageRecords) {
+      await onPageRecords(pageItems);
+    }
     console.log(`Scraped page ${targetPage}/${Number.isFinite(pageLimit) ? pageLimit : '?'} (${pageItems.length} records)`);
     if (onRecords) {
       await onRecords(records);
@@ -573,6 +775,218 @@ async function enrichWithBiographyPages({
   );
 
   return rows.map((row) => (row.url ? { ...row, ...detailsByUrl.get(row.url) } : row));
+}
+
+async function enrichCsvWithBiographyPages({
+  outputPath,
+  timeoutMs,
+  delayMs,
+  cookies,
+  detailConcurrency,
+  enrichedUrls = new Set()
+}) {
+  await ensureCsvFile(outputPath);
+  const stat = await fs.stat(outputPath);
+  const readEnd = stat.size > 0 ? stat.size - 1 : undefined;
+  const seenUrls = new Set();
+  const safeConcurrency = Math.max(1, Number.parseInt(detailConcurrency, 10) || 1);
+  const active = new Set();
+  let appendCheckpoint = Promise.resolve();
+  let scheduled = 0;
+  let completed = 0;
+  let skipped = 0;
+
+  const queueAppend = (record) => {
+    appendCheckpoint = appendCheckpoint.then(() => appendRecords(outputPath, [record]));
+    return appendCheckpoint;
+  };
+
+  const schedule = (row) => {
+    scheduled += 1;
+    const task = (async () => {
+      let details;
+      try {
+        const response = await fetchHtml(row.url, {
+          timeoutMs,
+          cookies,
+          retries: 1
+        });
+        const $ = cheerio.load(response.html);
+        details = extractBiographyDetails($, row.url);
+      } catch (error) {
+        details = { biography_url: row.url, biography_error: error.message };
+      }
+
+      await queueAppend({ ...row, ...details });
+      enrichedUrls.add(row.url);
+      completed += 1;
+      console.log(`Scraped biography details ${completed}/${scheduled}`);
+
+      if (delayMs > 0) {
+        await sleep(delayMs);
+      }
+    })();
+
+    active.add(task);
+    task.then(
+      () => active.delete(task),
+      () => active.delete(task)
+    );
+    return task;
+  };
+
+  await forEachCsvRecord(outputPath, async (row) => {
+    if (!row.url || seenUrls.has(row.url)) {
+      return;
+    }
+
+    seenUrls.add(row.url);
+    if (enrichedUrls.has(row.url) || hasBiographyDetails(row)) {
+      enrichedUrls.add(row.url);
+      skipped += 1;
+      return;
+    }
+
+    schedule(row);
+    if (active.size >= safeConcurrency) {
+      await Promise.race(active);
+    }
+  }, { end: readEnd });
+
+  await Promise.all(active);
+  await appendCheckpoint;
+
+  return {
+    scraped: completed,
+    skipped,
+    totalSeen: seenUrls.size
+  };
+}
+
+async function scrapeBiographiesToCsv({
+  baseUrl,
+  outputPath,
+  delayMs,
+  maxPages,
+  timeoutMs,
+  fetchDetails = true,
+  detailsDelayMs = 300,
+  detailConcurrency = 3,
+  initials,
+  discoverInitials = false,
+  csvProgress,
+  resumeState = { initials: {} },
+  onStateProgress
+}) {
+  await ensureCsvFile(outputPath);
+
+  const first = discoverInitials ? await fetchHtml(baseUrl, { timeoutMs }) : null;
+  const firstPage = first ? cheerio.load(first.html) : null;
+  const initialUrls = discoverInitials
+    ? extractInitialUrls(firstPage, baseUrl)
+    : buildInitialUrls(baseUrl, initials);
+  const urlsToScrape = initialUrls.length ? initialUrls : [baseUrl];
+
+  const progress = csvProgress || await loadCsvProgress(outputPath);
+  let totalPages = 0;
+  let scrapedPages = 0;
+  let latestCookies = first ? first.cookies : [];
+
+  const appendNewListingRecords = async (records) => {
+    const freshRecords = [];
+
+    for (const record of records) {
+      const key = getRecordKey(record);
+      if (!key || progress.knownKeys.has(key)) {
+        continue;
+      }
+
+      progress.knownKeys.add(key);
+      freshRecords.push(record);
+    }
+
+    if (freshRecords.length) {
+      await appendRecords(outputPath, freshRecords);
+    }
+  };
+
+  for (const [index, initialUrl] of urlsToScrape.entries()) {
+    const initialState = resumeState.initials?.[initialUrl];
+    if (initialState?.completed) {
+      totalPages += initialState.totalPages || 0;
+      console.log(`Skipping completed initial ${index + 1}/${urlsToScrape.length}: ${initialUrl}`);
+      continue;
+    }
+
+    const hasSavedPage = initialState?.html && initialState?.lastPage;
+    const initialFirst = hasSavedPage
+      ? { html: initialState.html, cookies: initialState.cookies || latestCookies }
+      : await fetchHtml(initialUrl, { timeoutMs, cookies: latestCookies });
+    const startPage = hasSavedPage ? initialState.lastPage : 1;
+
+    const listing = await scrapeViaPostback({
+      baseUrl: initialUrl,
+      delayMs,
+      maxPages,
+      timeoutMs,
+      firstHtml: initialFirst.html,
+      firstCookies: initialFirst.cookies,
+      startPage,
+      accumulateRecords: false,
+      onPageRecords: appendNewListingRecords,
+      onPageState: onStateProgress
+        ? (pageState) => onStateProgress({
+            initialUrl,
+            initialIndex: index,
+            totalInitials: urlsToScrape.length,
+            completed: false,
+            ...pageState
+          })
+        : undefined
+    });
+
+    latestCookies = listing.cookies;
+    totalPages += listing.totalPages;
+    scrapedPages += listing.scrapedPages;
+
+    if (onStateProgress) {
+      await onStateProgress({
+        initialUrl,
+        initialIndex: index,
+        totalInitials: urlsToScrape.length,
+        page: listing.currentPage,
+        totalPages: listing.totalPages,
+        html: listing.html,
+        cookies: latestCookies,
+        completed: true
+      });
+    }
+
+    console.log(`Completed initial ${index + 1}/${urlsToScrape.length}: ${initialUrl}`);
+    if (index < urlsToScrape.length - 1 && delayMs > 0) {
+      await sleep(delayMs);
+    }
+  }
+
+  const detailStats = fetchDetails
+    ? await enrichCsvWithBiographyPages({
+        outputPath,
+        timeoutMs,
+        delayMs: detailsDelayMs,
+        cookies: latestCookies,
+        detailConcurrency,
+        enrichedUrls: progress.enrichedUrls
+      })
+    : { scraped: 0, skipped: progress.enrichedUrls.size, totalSeen: progress.knownKeys.size };
+
+  return {
+    totalPages,
+    scrapedPages,
+    recordsSaved: progress.knownKeys.size,
+    detailsScraped: detailStats.scraped,
+    detailsSkipped: detailStats.skipped,
+    detailRowsSeen: detailStats.totalSeen
+  };
 }
 
 async function scrapeBiographies({
@@ -707,18 +1121,18 @@ async function main() {
   };
 
   try {
-    const existingRecords = options.resume ? await loadExistingRecords(options.outputPath) : [];
-    const scrapeState = options.resume ? await loadScrapeState(options.statePath) : { initials: {} };
-    if (existingRecords.length) {
-      console.log(`Loaded ${existingRecords.length} unique records from existing CSV for resume/deduplication`);
+    if (options.resume) {
+      await ensureCsvFile(options.outputPath);
+    } else {
+      await fs.writeFile(options.outputPath, `${CSV_COLUMNS.join(',')}\n`, 'utf8');
+      await saveScrapeState(options.statePath, { initials: {} });
     }
-    await saveRecords(options.outputPath, existingRecords);
 
-    let saveCheckpoint = Promise.resolve();
-    const queueCheckpoint = (records) => {
-      saveCheckpoint = saveCheckpoint.then(() => saveRecords(options.outputPath, records));
-      return saveCheckpoint;
-    };
+    const scrapeState = options.resume ? await loadScrapeState(options.statePath) : { initials: {} };
+    const csvProgress = await loadCsvProgress(options.outputPath);
+    if (csvProgress.knownKeys.size) {
+      console.log(`Loaded ${csvProgress.knownKeys.size} unique record keys from existing CSV for resume/deduplication`);
+    }
 
     let saveStateCheckpoint = Promise.resolve();
     const queueStateCheckpoint = ({ initialUrl, ...progress }) => {
@@ -732,19 +1146,21 @@ async function main() {
       return saveStateCheckpoint;
     };
 
-    const { totalPages, scrapedPages, records } = await scrapeBiographies({
+    const result = await scrapeBiographiesToCsv({
       ...options,
-      existingRecords,
-      onProgress: queueCheckpoint,
+      csvProgress,
       resumeState: scrapeState,
       onStateProgress: queueStateCheckpoint
     });
-    await queueCheckpoint(records);
     await saveStateCheckpoint;
 
-    console.log(`Total pages available: ${totalPages}`);
-    console.log(`Pages scraped: ${scrapedPages}`);
-    console.log(`Records saved: ${records.length}`);
+    const compacted = await compactCsv(options.outputPath);
+
+    console.log(`Total pages available: ${result.totalPages}`);
+    console.log(`Pages scraped: ${result.scrapedPages}`);
+    console.log(`Biography details scraped: ${result.detailsScraped}`);
+    console.log(`Biography details already present: ${result.detailsSkipped}`);
+    console.log(`Records saved: ${compacted.records}`);
     console.log(`Output file: ${options.outputPath}`);
     console.log(`Resume state file: ${options.statePath}`);
   } catch (error) {
@@ -771,11 +1187,16 @@ module.exports = {
   parseAspNetState,
   getPaginationTargets,
   scrapeBiographies,
+  scrapeBiographiesToCsv,
   toCsv,
   parseCsv,
+  parseCsvRows,
   dedupeRecords,
   loadExistingRecords,
   saveRecords,
+  appendRecords,
+  loadCsvProgress,
+  compactCsv,
   getDefaultStatePath,
   loadScrapeState,
   saveScrapeState,

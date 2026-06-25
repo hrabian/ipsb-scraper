@@ -6,7 +6,13 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 
-const { scrapeBiographies, saveRecords } = require('../scraper');
+const {
+  scrapeBiographies,
+  scrapeBiographiesToCsv,
+  saveRecords,
+  compactCsv,
+  parseCsv
+} = require('../scraper');
 
 function pageHtml({ currentPage, pagerLabels, biographies }) {
   const pager = pagerLabels
@@ -159,6 +165,42 @@ test('scrapeBiographies follows postbacks and enriches records from biography pa
     assert.equal(result.records[0].biography_text, 'Ala opis biograficzny.');
   } finally {
     server.close();
+  }
+});
+
+test('scrapeBiographiesToCsv checkpoints listings and details in low-memory mode', async () => {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'ipsb-low-memory-'));
+  const outputPath = path.join(tempDir, 'biography_data.csv');
+  const server = createServer();
+  await new Promise((resolve) => server.listen(0, resolve));
+
+  const { port } = server.address();
+  const baseUrl = `http://127.0.0.1:${port}/Search/Type,Biography/Initial,A/`;
+
+  try {
+    const result = await scrapeBiographiesToCsv({
+      baseUrl,
+      outputPath,
+      delayMs: 0,
+      timeoutMs: 5000,
+      maxPages: 2,
+      fetchDetails: true,
+      detailsDelayMs: 0
+    });
+    const compacted = await compactCsv(outputPath);
+    const rows = parseCsv(await fsp.readFile(outputPath, 'utf8'));
+
+    assert.equal(result.totalPages, 2);
+    assert.equal(result.scrapedPages, 2);
+    assert.equal(result.recordsSaved, 2);
+    assert.equal(result.detailsScraped, 2);
+    assert.equal(compacted.records, 2);
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].biography_name, 'Ala Nowak');
+    assert.equal(rows[1].biography_text, 'Adam opis biograficzny.');
+  } finally {
+    server.close();
+    await fsp.rm(tempDir, { recursive: true, force: true });
   }
 });
 

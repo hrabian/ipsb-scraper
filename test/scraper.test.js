@@ -1,5 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
 const cheerio = require('cheerio');
 
 const {
@@ -12,7 +15,11 @@ const {
   toCsv,
   updateCookies,
   extractInitialUrls,
-  buildInitialUrls
+  buildInitialUrls,
+  appendRecords,
+  loadCsvProgress,
+  compactCsv,
+  parseCsv
 } = require('../scraper');
 
 test('extractTotalPages returns highest visible page number from links and span', () => {
@@ -169,7 +176,6 @@ test('extractInitialUrls discovers unique initial links and buildInitialUrls rep
 
 test('parseCsv and dedupeRecords detect duplicate CSV rows by URL and merge newest data', () => {
   const {
-    parseCsv,
     dedupeRecords
   } = require('../scraper');
 
@@ -183,4 +189,40 @@ test('parseCsv and dedupeRecords detect duplicate CSV rows by URL and merge newe
     name: 'New',
     biography_text: 'new text'
   });
+});
+
+test('appendRecords checkpoints incrementally and compactCsv keeps the latest row per URL', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ipsb-stream-csv-'));
+  const outputPath = path.join(tempDir, 'biography_data.csv');
+
+  try {
+    await appendRecords(outputPath, [
+      {
+        url: 'https://www.ipsb.nina.gov.pl/a/biografia/test',
+        name: 'Test Person',
+        activity: 'pisarz'
+      }
+    ]);
+    await appendRecords(outputPath, [
+      {
+        url: 'https://www.ipsb.nina.gov.pl/a/biografia/test',
+        name: 'Test Person',
+        activity: 'pisarz',
+        biography_text: 'Full biography text.'
+      }
+    ]);
+
+    const progress = await loadCsvProgress(outputPath);
+    assert.equal(progress.knownKeys.size, 1);
+    assert.equal(progress.enrichedUrls.has('https://www.ipsb.nina.gov.pl/a/biografia/test'), true);
+
+    const compacted = await compactCsv(outputPath);
+    const rows = parseCsv(await fs.readFile(outputPath, 'utf8'));
+
+    assert.equal(compacted.records, 1);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].biography_text, 'Full biography text.');
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
 });

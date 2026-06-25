@@ -1,6 +1,7 @@
 # IPSB Scraper
 
 Node.js scraper for IPSB biography listings with incremental CSV checkpoints and resume support.
+The CLI writes checkpoints in an append-only, low-memory mode and compacts the CSV after a successful run.
 
 ## Running
 
@@ -10,16 +11,18 @@ npm run scrape
 ```
 
 By default the scraper writes `biography_data.csv` and a sidecar state file named `biography_data.csv.state.json`.
+During a long run the CSV can temporarily contain older checkpoint rows for the same URL; after the run finishes it is compacted back to one latest row per biography.
 
 ## Resume behavior
 
 Resume is enabled by default. On startup the scraper:
 
-1. loads existing records from the output CSV,
+1. scans existing record keys from the output CSV without loading full biography texts into memory,
 2. loads per-initial page state from the JSON sidecar,
-3. writes an initial CSV checkpoint immediately,
-4. continues listings from saved page HTML/last page where available,
-5. writes CSV and JSON checkpoints as progress is made.
+3. continues listings from saved page HTML/last page where available,
+4. appends CSV and JSON checkpoints as progress is made,
+5. skips biography detail pages that are already present in the CSV,
+6. compacts the CSV after a successful run.
 
 Set `RESUME=false` to ignore existing CSV/state files for a fresh run.
 
@@ -32,6 +35,7 @@ Useful environment variables:
 | `INITIALS` | Polish initials list | Comma-separated initials, or `discover`. |
 | `MAX_PAGES` | unset | Optional page limit for testing. |
 | `FETCH_DETAILS` | `true` | Set to `false` to skip biography detail pages. |
+| `DETAIL_CONCURRENCY` | `3` | Number of biography detail pages fetched in parallel. |
 
 ## Wikidata occupation suggestions
 
